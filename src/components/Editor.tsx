@@ -226,9 +226,9 @@ export default function Editor() {
     setIsFfmpegProcessing(true);
     setFfmpegStatus('FFmpeg 엔진을 불러오는 중...');
     
-    // 5초 로딩 타임아웃 정의 (브라우저 또는 WebView 내 SharedArrayBuffer 미지원 시 무한 로딩 방지)
+    // 타임아웃 정의 (CDN 장애나 로컬 보안 정책 충돌 시 최상 품질의 WebM 다운로드 보장)
     const timeoutPromise = new Promise<never>((_, reject) => {
-      setTimeout(() => reject(new Error('TIMEOUT_FFMPEG')), 5000);
+      setTimeout(() => reject(new Error('TIMEOUT_FFMPEG')), 6000);
     });
 
     try {
@@ -241,19 +241,52 @@ export default function Editor() {
         }
       });
 
-      // unpkg 대신 CORS 및 캐시 전송 속도가 훨씬 빠르고 안정적인 jsdelivr 사용
-      const baseURL = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/esm';
+      // 여러 CDN 백업 풀을 구축하여 한 곳이 느리거나 끊겨도 무한 로딩 대신 즉시 백업 CDN으로 신속 로딩
+      const baseURLs = [
+        'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/esm',
+        'https://fastly.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/esm',
+        'https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm',
+      ];
       
-      setFfmpegStatus('FFmpeg 엔진 초기화 중...');
+      let loaded = false;
       
-      // Promise.race를 사용하여 타임아웃 시 즉시 WebM으로 안전하게 대체하여 무한 대기 차단
-      await Promise.race([
-        ffmpeg.load({
-          coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
-          wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm'),
-        }),
-        timeoutPromise
-      ]);
+      for (const baseURL of baseURLs) {
+        try {
+          const cdnName = baseURL.includes('fastly') 
+            ? 'Fastly jsDelivr' 
+            : baseURL.includes('jsdelivr') 
+              ? 'jsDelivr' 
+              : 'Unpkg';
+          
+          setFfmpegStatus(`FFmpeg 엔진 초기화 중 (${cdnName} CDN)...`);
+          
+          const loadPromise = (async () => {
+            const coreURL = await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript');
+            const wasmURL = await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm');
+            await ffmpeg.load({
+              coreURL,
+              wasmURL,
+            });
+          })();
+
+          // 개별 CDN 시도를 3초 시간제한으로 신속 점검하여 다음 백업풀로 빠르게 전환되도록 설계
+          const singleCdnTimeout = new Promise<never>((_, reject) => {
+            setTimeout(() => reject(new Error('TIMEOUT_SINGLE_CDN')), 3000);
+          });
+
+          await Promise.race([loadPromise, singleCdnTimeout]);
+          loaded = true;
+          console.log(`Successfully loaded FFmpeg from ${baseURL}`);
+          break;
+        } catch (singleErr) {
+          console.warn(`Failed loading from ${baseURL}, switching to backup CDN...`, singleErr);
+        }
+      }
+
+      if (!loaded) {
+        // 백업 풀이 전부 실패한 경우 전체 타임아웃 에러를 발생시킵니다.
+        throw new Error('TIMEOUT_FFMPEG');
+      }
 
       setFfmpegStatus('비디오 데이터를 변환하는 중...');
       const webmData = await fetchFile(webmBlob);
@@ -270,7 +303,7 @@ export default function Editor() {
     } catch (err: any) {
       if (err?.message === 'TIMEOUT_FFMPEG') {
         console.warn('FFmpeg engine load timed out. Falling back to high-quality WebM.');
-        alert('안내: 로컬 보안 정책 또는 환경 차이로 인해 MP4 변환 엔진 작동이 오래 지속되어, 무한 정지 방지 규칙에 따라 최고 화질 WebM 비디오로 즉시 변환 저장을 실행합니다! 모바일 및 미디어 플레이어 재생이 전체 지원됩니다.');
+        alert('안내: 네트워크 상태 또는 로컬 보안 수준(예: SharedArrayBuffer 제한)으로 인해 MP4 코덱 변환 기능이 제한되어, 최고 화질을 보존한 WebM 비디오 파일로 즉시 안전 저장을 진행합니다! 모바일 및 미디어 플레이어 전용 재생이 모두 지원됩니다.');
       } else {
         console.error('FFmpeg transcode failed, falling back to WebM:', err);
       }
